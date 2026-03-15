@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Dict, List
 
 import numpy as np
@@ -27,8 +28,26 @@ def preprocess_input(df: pd.DataFrame, cfg: ProjectConfig, scaler: object, infer
     directional_columns: List[str] = list(inference_config.get("directional_columns", cfg.data.directional_columns))
 
     base_df = df.copy()
+    # Normalize column names to avoid BOM/whitespace/case mismatches.
+    base_df.columns = [str(c).strip().lstrip("\ufeff") for c in base_df.columns]
+    col_map = {c.lower(): c for c in base_df.columns}
+    if cfg.data.station_col not in base_df.columns and cfg.data.station_col.lower() in col_map:
+        base_df = base_df.rename(columns={col_map[cfg.data.station_col.lower()]: cfg.data.station_col})
+    if cfg.data.timestamp_col not in base_df.columns and cfg.data.timestamp_col.lower() in col_map:
+        base_df = base_df.rename(columns={col_map[cfg.data.timestamp_col.lower()]: cfg.data.timestamp_col})
+    # Fallback: match on alphanumeric-only keys for odd CSV headers.
+    def _key(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9]+", "", s).upper()
+    key_map = {_key(c): c for c in base_df.columns}
+    station_key = _key(cfg.data.station_col)
+    time_key = _key(cfg.data.timestamp_col)
+    if cfg.data.station_col not in base_df.columns and station_key in key_map:
+        base_df = base_df.rename(columns={key_map[station_key]: cfg.data.station_col})
+    if cfg.data.timestamp_col not in base_df.columns and time_key in key_map:
+        base_df = base_df.rename(columns={key_map[time_key]: cfg.data.timestamp_col})
+
     if cfg.data.timestamp_col not in base_df.columns:
-        raise ValueError(f"Missing timestamp column: {cfg.data.timestamp_col}")
+        raise ValueError(f"Missing timestamp column: {cfg.data.timestamp_col}. Available: {sorted(base_df.columns)[:20]}")
     if cfg.data.station_col not in base_df.columns:
         # Fallback for single-station uploads.
         base_df[cfg.data.station_col] = "STATION_0"

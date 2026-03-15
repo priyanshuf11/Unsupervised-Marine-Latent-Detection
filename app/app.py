@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import StringIO
+import re
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,28 @@ def _load_input_df(uploaded_file, sample_path: Path) -> pd.DataFrame | None:
             return pd.read_parquet(sample_path)
         return pd.read_csv(sample_path)
     return None
+
+
+def _normalize_input_columns(df: pd.DataFrame, station_col: str, timestamp_col: str) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
+    col_map = {c.lower(): c for c in df.columns}
+    if station_col not in df.columns and station_col.lower() in col_map:
+        df = df.rename(columns={col_map[station_col.lower()]: station_col})
+    if timestamp_col not in df.columns and timestamp_col.lower() in col_map:
+        df = df.rename(columns={col_map[timestamp_col.lower()]: timestamp_col})
+    def _key(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9]+", "", s).upper()
+    key_map = {_key(c): c for c in df.columns}
+    station_key = _key(station_col)
+    time_key = _key(timestamp_col)
+    if station_col not in df.columns and station_key in key_map:
+        df = df.rename(columns={key_map[station_key]: station_col})
+    if timestamp_col not in df.columns and time_key in key_map:
+        df = df.rename(columns={key_map[time_key]: timestamp_col})
+    if station_col not in df.columns:
+        df[station_col] = "STATION_0"
+    return df
 
 
 def _top_feature_columns(df: pd.DataFrame) -> list[str]:
@@ -257,6 +280,10 @@ def main() -> None:
         st.info("Upload a CSV or enable the default NOAA sample toggle.")
         return
 
+    df = _normalize_input_columns(df, cfg.data.station_col, cfg.data.timestamp_col)
+    with st.expander("Debug: Detected Columns", expanded=False):
+        st.write(sorted(df.columns))
+
     st.success("Dataset loaded successfully")
     st.dataframe(df.head(10), width="stretch")
 
@@ -271,6 +298,7 @@ def main() -> None:
         reconstruction_errors = compute_reconstruction_errors(models.ae_model, prep.x_scaled)
     except Exception as exc:
         st.error(f"Inference failed: {exc}")
+        st.exception(exc)
         return
 
     out_df = _window_output_frame(prep.windowed.meta, prep.windowed.X, micro=pd.Series(micro_states), macro=pd.Series(macro_states))

@@ -69,12 +69,19 @@ def handle_missing_values(
             g[dcol] = (np.rad2deg(np.arctan2(sin, cos)) + 360) % 360
         return g
 
-    grouped = out.groupby(group_col, group_keys=False)
+    grouped = out.groupby(group_col, group_keys=True)
     try:
         # Pandas >= 2.2 supports include_groups to silence deprecation warning.
         out = grouped.apply(_fill_group, include_groups=False)
     except TypeError:
         out = grouped.apply(_fill_group)
+
+    # Ensure group column is preserved after apply.
+    if group_col not in out.columns:
+        if isinstance(out.index, pd.MultiIndex) and group_col in out.index.names:
+            out = out.reset_index(level=group_col)
+        elif out.index.name == group_col:
+            out = out.reset_index()
 
     if drop_large_gap_rows:
         out = out.dropna(subset=numeric_columns)
