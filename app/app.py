@@ -43,16 +43,41 @@ def _window_output_frame(meta: pd.DataFrame, window_features: pd.DataFrame, micr
     return out
 
 
-def _load_input_df(uploaded_file, sample_path: Path) -> pd.DataFrame | None:
+def _load_input_df(
+    uploaded_file,
+    sample_path: Path,
+    columns: list[str] | None = None,
+    row_cap: int | None = None,
+    use_last_rows: bool = True,
+) -> pd.DataFrame | None:
+    def _apply_row_cap(frame: pd.DataFrame) -> pd.DataFrame:
+        if row_cap is None:
+            return frame
+        return frame.tail(row_cap) if use_last_rows else frame.head(row_cap)
+
     if uploaded_file is not None:
         suffix = Path(uploaded_file.name).suffix.lower()
         if suffix == ".parquet":
-            return pd.read_parquet(uploaded_file)
-        return pd.read_csv(StringIO(uploaded_file.getvalue().decode("utf-8")))
+            df = pd.read_parquet(uploaded_file, columns=columns)
+            return _apply_row_cap(df)
+        read_kwargs = {}
+        if columns is not None:
+            read_kwargs["usecols"] = columns
+        if row_cap is not None and not use_last_rows:
+            read_kwargs["nrows"] = row_cap
+        df = pd.read_csv(StringIO(uploaded_file.getvalue().decode("utf-8")), **read_kwargs)
+        return _apply_row_cap(df)
     if sample_path.exists():
         if sample_path.suffix.lower() == ".parquet":
-            return pd.read_parquet(sample_path)
-        return pd.read_csv(sample_path)
+            df = pd.read_parquet(sample_path, columns=columns)
+            return _apply_row_cap(df)
+        read_kwargs = {}
+        if columns is not None:
+            read_kwargs["usecols"] = columns
+        if row_cap is not None and not use_last_rows:
+            read_kwargs["nrows"] = row_cap
+        df = pd.read_csv(sample_path, **read_kwargs)
+        return _apply_row_cap(df)
     return None
 
 
@@ -141,6 +166,120 @@ def _risk_snapshot(df: pd.DataFrame) -> tuple[str, str]:
     if score >= 2.5:
         return "Medium", "Moderate marine variability (" + ", ".join(details) + ")."
     return "Low", "Relatively calm marine behavior (" + ", ".join(details) + ")."
+
+
+def _normalize_score(series: pd.Series) -> pd.Series:
+    vals = pd.to_numeric(series, errors="coerce")
+    lo = float(vals.min())
+    hi = float(vals.max())
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo <= 1e-9:
+        return pd.Series([0.0] * len(series), index=series.index)
+    return (vals - lo) / (hi - lo)
+
+
+def _macro_severity_map(df: pd.DataFrame) -> pd.DataFrame:
+    wave_col = _first_mean_col(df, "WAVE_HGT")
+    wind_col = _first_mean_col(df, "WIND_SPEED")
+    if wave_col is None and wind_col is None:
+        return pd.DataFrame()
+
+    grp = df.groupby("macro_state")
+    summary = pd.DataFrame(index=grp.size().index)
+    if wave_col is not None:
+        summary["wave_mean"] = grp[wave_col].mean()
+    if wind_col is not None:
+        summary["wind_mean"] = grp[wind_col].mean()
+
+    score = pd.Series(0.0, index=summary.index)
+    if "wave_mean" in summary.columns:
+        score += 0.7 * _normalize_score(summary["wave_mean"])
+    if "wind_mean" in summary.columns:
+        score += 0.3 * _normalize_score(summary["wind_mean"])
+    summary["severity_score"] = score
+
+    def _level(val: float) -> str:
+        if val >= 0.66:
+            return "High"
+        if val >= 0.33:
+            return "Medium"
+        return "Low"
+
+    summary["severity_level"] = summary["severity_score"].apply(_level)
+    summary = summary.reset_index().rename(columns={"index": "macro_state"})
+    return summary.sort_values("severity_score", ascending=False)
+
+
+def _station_early_warning(
+    df: pd.DataFrame,
+    station_col: str,
+    hmm_model: object,
+    macro_mapping: dict[int, int] | None,
+) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    wave_col = _first_mean_col(df, "WAVE_HGT")
+    wind_col = _first_mean_col(df, "WIND_SPEED")
+    if wave_col is None and wind_col is None:
+        return pd.DataFrame()
+
+    severity = _macro_severity_map(df)
+    if severity.empty:
+        return pd.DataFrame()
+    severity_map = severity.set_index("macro_state")
+    high_macros = set(severity_map[severity_map["severity_level"] == "High"].index.tolist())
+
+    if "end_time" not in df.columns:
+        return pd.DataFrame()
+
+    idx = df.groupby(station_col)["end_time"].idxmax()
+    latest = df.loc[idx].copy()
+    latest["macro_state"] = latest["macro_state"].astype(int)
+    latest["current_severity"] = latest["macro_state"].map(severity_map["severity_score"]).fillna(0.0)
+    latest["current_level"] = latest["macro_state"].map(severity_map["severity_level"]).fillna("Unknown")
+
+    prob_high_next = []
+    for _, row in latest.iterrows():
+        cur_micro = int(row.get("micro_state", -1))
+        probs = _next_macro_probabilities(hmm_model, cur_micro, macro_mapping)
+        if probs.empty or not high_macros:
+            prob_high_next.append(0.0)
+        else:
+            prob_high_next.append(float(probs[probs["macro_state"].isin(high_macros)]["probability"].sum()))
+    latest["prob_high_next"] = prob_high_next
+
+    latest["risk_score"] = 0.7 * latest["current_severity"] + 0.3 * latest["prob_high_next"]
+
+    def _risk_level(val: float) -> str:
+        if val >= 0.66:
+            return "High"
+        if val >= 0.33:
+            return "Medium"
+        return "Low"
+
+    latest["risk_level"] = latest["risk_score"].apply(_risk_level)
+    if wave_col is not None:
+        latest["wave_mean"] = latest[wave_col]
+    if wind_col is not None:
+        latest["wind_mean"] = latest[wind_col]
+
+    def _explain(row: pd.Series) -> str:
+        parts = [f"regime={int(row['macro_state'])} ({row['current_level']})"]
+        if wave_col is not None:
+            parts.append(f"wave={float(row['wave_mean']):.2f}")
+        if wind_col is not None:
+            parts.append(f"wind={float(row['wind_mean']):.2f}")
+        parts.append(f"next-high-prob={float(row['prob_high_next']):.2f}")
+        return " | ".join(parts)
+
+    latest["explanation"] = latest.apply(_explain, axis=1)
+    keep_cols = [station_col, "end_time", "macro_state", "risk_level", "risk_score", "prob_high_next", "explanation"]
+    if wave_col is not None:
+        keep_cols.insert(4, "wave_mean")
+    if wind_col is not None:
+        keep_cols.insert(5 if wave_col is not None else 4, "wind_mean")
+
+    return latest[keep_cols].sort_values(["risk_score", "prob_high_next"], ascending=False)
 
 
 def _next_macro_probabilities(
@@ -275,7 +414,22 @@ def main() -> None:
     uploaded = st.file_uploader("Upload Marine Dataset", type=["csv", "parquet"])
     use_sample = st.toggle("Use default NOAA sample dataset (data/raw/merged final.parquet)", value=(uploaded is None))
 
-    df = _load_input_df(uploaded, sample_path if use_sample else Path("__missing__"))
+    st.subheader("Ingestion Safety")
+    max_rows = st.slider("Row cap (max rows to process)", min_value=50_000, max_value=1_000_000, value=300_000, step=50_000)
+    use_last_rows = st.toggle("Use last N rows (recommended)", value=True)
+    st.caption("For CSV uploads, using last N rows may be slower because the full file must be read.")
+
+    inferred_numeric = list(inf_cfg.get("numeric_columns", cfg.data.numeric_columns))
+    inferred_directional = list(inf_cfg.get("directional_columns", cfg.data.directional_columns))
+    needed_columns = [cfg.data.station_col, cfg.data.timestamp_col, *inferred_numeric, *inferred_directional]
+
+    df = _load_input_df(
+        uploaded,
+        sample_path if use_sample else Path("__missing__"),
+        columns=needed_columns,
+        row_cap=max_rows,
+        use_last_rows=use_last_rows,
+    )
     if df is None:
         st.info("Upload a CSV or enable the default NOAA sample toggle.")
         return
@@ -314,6 +468,9 @@ def main() -> None:
     else:
         out_view = out_df
 
+    station_col = "station" if "station" in out_view.columns else cfg.data.station_col
+    early_warning_df = _station_early_warning(out_view, station_col, models.hmm_model, models.macro_mapping)
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Rows", f"{len(df):,}")
     c2.metric("Windows", f"{len(out_view):,}")
@@ -323,8 +480,16 @@ def main() -> None:
     risk_level, risk_note = _risk_snapshot(out_view)
     st.info(f"Operational Risk Meter: **{risk_level}** | {risk_note}")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["Regime Timeline", "Regime Intelligence", "Operational Insights", "Transitions & Stability", "Feature Profiles", "Export"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        [
+            "Regime Timeline",
+            "Regime Intelligence",
+            "Operational Insights",
+            "Early Warning",
+            "Transitions & Stability",
+            "Feature Profiles",
+            "Export",
+        ]
     )
 
     with tab1:
@@ -392,6 +557,19 @@ def main() -> None:
             st.info("Anomaly panel requires dense autoencoder artifacts.")
 
     with tab4:
+        st.subheader("Early Warning System")
+        if early_warning_df.empty:
+            st.info("Not enough wave/wind features to compute early warning signals.")
+        else:
+            st.markdown("Risk score = 0.7 x current regime severity + 0.3 x probability of switching into a high-risk regime.")
+            st.caption("High-risk regimes are those with the highest wave/wind means across the full run.")
+            st.dataframe(early_warning_df.head(25), width="stretch")
+            st.subheader("Macro Regime Severity Map")
+            severity_map = _macro_severity_map(out_view)
+            st.dataframe(severity_map, width="stretch")
+
+    with tab5:
+        st.subheader("Transitions & Stability")
         left, right = st.columns(2)
         with left:
             st.plotly_chart(transition_heatmap(out_view["macro_state"].values, "Macro Transition Matrix"), width="stretch")
@@ -400,7 +578,7 @@ def main() -> None:
             st.plotly_chart(transition_heatmap(out_view["micro_state"].values, "Micro-State Transition Matrix"), width="stretch")
             st.plotly_chart(micro_macro_heatmap(out_view["micro_state"].values, out_view["macro_state"].values, "Micro -> Macro Occupancy"), width="stretch")
 
-    with tab5:
+    with tab6:
         st.subheader("Regime Feature Profiles")
         selected_features = _top_feature_columns(out_view)
         if selected_features:
@@ -416,7 +594,7 @@ def main() -> None:
             lat_plot = pd.DataFrame({"latent_1": lat_df.iloc[:, 0], "latent_2": lat_df.iloc[:, 1], "macro": out_view["macro_state_name"].values})
             st.scatter_chart(lat_plot, x="latent_1", y="latent_2", color="macro")
 
-    with tab6:
+    with tab7:
         st.subheader("Download Regime-Labeled Window Dataset")
         st.download_button(
             label="Download regime_labels.csv",
@@ -424,6 +602,15 @@ def main() -> None:
             file_name="regime_labels.csv",
             mime="text/csv",
         )
+
+        if not early_warning_df.empty:
+            st.subheader("Download Early-Warning Table")
+            st.download_button(
+                label="Download early_warning.csv",
+                data=early_warning_df.to_csv(index=False).encode("utf-8"),
+                file_name="early_warning.csv",
+                mime="text/csv",
+            )
 
         st.subheader("Project Reminder")
         st.markdown(
